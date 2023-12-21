@@ -5,10 +5,11 @@
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <WebSocketsClient.h>
+#include <dht.h>
+
 WiFiMulti WiFiMulti;
 WebSocketsClient webSocket;
 
-boolean connected = false;
 
 const char * generateUID(){
     const char possible[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -24,7 +25,7 @@ const char * generateUID(){
 namespace JSON {
     class serializer {
     public:
-        static String serializeRequestData(const char* key1, const char* val1, const char* key2, const char* val2);
+        static String serializeRequestData(const char* key1, const char* val1, const char* key2, int val2);
     };
     class deserializer {
     public:
@@ -42,7 +43,7 @@ DynamicJsonDocument JSON::deserializer::deserializeData(const char* input) {
         return doc;
 };
 
-String JSON::serializer::serializeRequestData(const char* key1, const char* val1, const char* key2 = nullptr, const char* val2 = nullptr) {
+String JSON::serializer::serializeRequestData(const char* key1, const char* val1, const char* key2, int val2) {
     DynamicJsonDocument doc(256);
     String JSONData;
     if(key1 && val1) {
@@ -57,15 +58,34 @@ String JSON::serializer::serializeRequestData(const char* key1, const char* val1
 }
 
 namespace pins {
-    constexpr int relayPin = 26;
+    constexpr int sensorPin = 26;
     constexpr int defaultLed = 2;
+}
+
+namespace Messages {
+    constexpr const char *LowTemp = "LowTemp";
+    constexpr const char *HighTemp = "HighTemp";
+    constexpr const char *LowHum = "LowHum";
+    constexpr const char *HighHum = "HighHum";
+    namespace Warnings {
+        const char* humWarning{};
+        const char* tempWarning{};
+    }
+}
+
+namespace BackupVariables {
+    class variables {
+    public:
+        int humidity = 0;
+        int temperature = 0;
+    };
 }
 
 
 
 using namespace pins;
 using namespace JSON;
-
+BackupVariables::variables backupVars;
 
 void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     switch(type) {
@@ -74,13 +94,15 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             break;
         case WStype_CONNECTED:
             Serial.printf("[WS] Connected to url: %s\n", payload);
-            connected = true;
             break;
         case WStype_TEXT: {
-//            Serial.printf("[WS] Incoming data %s\n", payload);
             const char* Payload = (char *) payload;
             DynamicJsonDocument payloadData = JSON::deserializer::deserializeData(Payload);
-            Serial.println(payloadData["type"].as<const char*>());
+            if (payloadData["type"]) {
+                if (strcmp(payloadData["type"], "PONG") == 0) {
+                    Serial.printf("[WS]: Ping/Pong Frame Event: %s\n", payloadData["type"].as<const char*>());
+                }
+            }
         }
             break;
         case WStype_BIN:
@@ -96,14 +118,14 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
 }
 
 
+DHT dht(sensorPin, DHT11);
 
 void setup() {
     Serial.begin(9600);
-
-    pinMode(relayPin, OUTPUT);
+    pinMode(sensorPin, OUTPUT);
     pinMode(defaultLed, OUTPUT);
     digitalWrite(defaultLed, HIGH);
-
+    dht.begin();
     WiFiMulti.addAP("ssid", "passcode");
 
     while(WiFiMulti.run() != WL_CONNECTED) {
@@ -120,16 +142,47 @@ void setup() {
 }
 
 void loop() {
-    if(connected) {
+    webSocket.loop();
+    if(webSocket.isConnected()) {
         static unsigned long lastSend = 0;
-        if(millis() - lastSend >= 500) {
+        static unsigned long lastPing = 0;
+        if(millis() - lastSend >= 1000) {
             Serial.println("Sending");
-            String payloadReady = serializer::serializeRequestData("type", "RECEIVE_DATA", "data", generateUID());
+            int temperature = dht.readTemperature();
+            Serial.println(temperature);
+            if (temperature > 50) {
+                if (backupVars.temperature > 0) {
+                    temperature = backupVars.temperature;
+                    Serial.println("Adjusted temp due to error.");
+                } else {
+                    Serial.println("Unset value");
+                }
+            }
+            if (temperature > 30) {
+                Messages::Warnings::tempWarning = Messages::HighTemp;
+            } else if (temperature < 20) {
+                Messages::Warnings::tempWarning = Messages::LowTemp;
+            } else {
+                Messages::Warnings::tempWarning = "Normal";
+            }
+            backupVars.temperature = temperature;
+            String payloadReady = serializer::serializeRequestData("type", "SEND_DATA", "data", temperature);
             webSocket.sendTXT(payloadReady);
             digitalWrite(defaultLed, HIGH);
+            yield();
+            delay(50);
             digitalWrite(defaultLed, LOW);
             lastSend = millis();
         }
+        if (millis() - lastPing >= 5000) {
+            Serial.println("[WS]: Pinging...");
+            if (webSocket.isConnected()) {
+                String pingPacket = serializer::serializeRequestData("type", "PING", "data", 0);
+                webSocket.sendTXT(pingPacket);
+                lastPing = millis();
+            } else {
+                Serial.println("[WS]: Ping Frame not sent: Ws closed.");
+            }
+        }
     }
-    webSocket.loop();
 }
